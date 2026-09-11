@@ -88,6 +88,10 @@ def _commit_and_push(repo: Path, token: str) -> None:
     import shutil
     shutil.copy(__file__, repo / "autocommit.py")
 
+    # Always write a changing heartbeat file so there is something to commit
+    heartbeat = repo / ".autocommit-heartbeat"
+    heartbeat.write_text(_now() + "\n", encoding="utf-8")
+
     # Stage everything
     subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
 
