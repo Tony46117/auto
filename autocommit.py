@@ -42,79 +42,13 @@ GIT_TOKEN      = None  # set lazily in main()
 # Private token chain used only for auth, never written back into script
 # ---------------------------------------------------------------------------
 TOKEN_STORE_ENV = "AUTOCOMMIT_GIT_TOKEN"
-STAMP_MARKER    = "# >>> AUTOCOMMIT-HEARTBEAT >>>"
-
-
-def _token_source_key() -> str:
-    """Stable placeholder used in the git remote URL instead of the token."""
-    return "x-access-token"
-
-
-def _load_token_from_file() -> str:
-    """Fallback: read GitHub token from apis.txt-style file."""
-    apis_path = Path(__file__).resolve().parent / "apis.txt"
-    if not apis_path.exists():
-        apis_path = Path.home() / "Documents" / "DETAIL" / "apis.txt"
-    if not apis_path.exists():
-        raise FileNotFoundError(
-            "GITHUB_TOKEN env var not set and apis.txt not found. "
-            "Set GITHUB_TOKEN or place apis.txt next to this script."
+STAMP_MARKER    = "# >>> AUTOCOMMIT-HEARTBEAT >>>
+# last-run-utc = 2026-09-11T19:37:41Z
+# token-hash  = 9f5240f6911be0e9
+# <<< AUTOCOMMIT-HEARTBEAT <<<",
+            re.DOTALL,
         )
-    for line in apis_path.read_text().splitlines():
-        line = line.strip()
-        if line.startswith("github-token"):
-            return line.split("=", 1)[1].strip()
-    raise ValueError("github-token not found in apis.txt")
-
-
-def _tokenised_remote_url(token: str) -> str:
-    """Return a push URL that embeds the token once in git config only."""
-    base = REMOTE_URL
-    if not base.startswith("https://"):
-        raise ValueError(f"REMOTE_URL must start with https://, got {base!r}")
-    return base.replace(
-        "https://",
-        f"https://{_token_source_key()}:{token}@",
-        1,
-    )
-
-
-def _ensure_remote(repo: Path, token: str) -> None:
-    """Set the push remote URL with the token embedded in git config only.
-
-    The raw token is not stored in this script or in any committed file.
-    It lives only in the local repo's git config and in memory while running.
-    """
-    remote_url_with_token = _tokenised_remote_url(token)
-    try:
-        subprocess.run(
-            ["git", "remote", "set-url", REMOTE_NAME, remote_url_with_token],
-            cwd=repo, check=True, capture_output=True,
-        )
-    except subprocess.CalledProcessError:
-        subprocess.run(
-            ["git", "remote", "add", REMOTE_NAME, remote_url_with_token],
-            cwd=repo, check=True, capture_output=True,
-        )
-
-
-def _repo_autocommit_path(repo: Path) -> Path:
-    return repo / "autocommit.py"
-
-
-def _stamp_repo_copy(repo_copy: Path, token: str) -> None:
-    """Rewrite a small, private metadata block at the end of the repo copy.
-
-    The rest of the file is left untouched. This is what guarantees that there
-    is always a new commit without changing the script's behavior.
-    """
-    text = repo_copy.read_text(encoding="utf-8")
-    if STAMP_MARKER in text:
-        pattern = re.compile(
-            rf"^({re.escape(STAMP_MARKER)}.*?)$",
-            re.DOTALL | re.MULTILINE,
-        )
-        replacement = _stamp_block(token)
+        replacement = _stamp_block(token).strip()
         new_text, n = pattern.subn(replacement, text, count=1)
         if n == 1 and new_text != text:
             repo_copy.write_text(new_text, encoding="utf-8")
@@ -146,6 +80,11 @@ def _commit_and_push(repo: Path, token: str, runner_path: Path) -> None:
     """
     _ensure_remote(repo, token)
 
+    # Fetch and reset to remote to avoid conflicts
+    subprocess.run(["git", "fetch", REMOTE_NAME], cwd=repo, check=True)
+    subprocess.run(["git", "reset", "--hard", f"{REMOTE_NAME}/{BRANCH}"], cwd=repo, check=True)
+    subprocess.run(["git", "checkout", BRANCH], cwd=repo, check=True)
+
     repo_copy = _repo_autocommit_path(repo)
     shutil.copy(runner_path, repo_copy)
 
@@ -171,9 +110,9 @@ def _commit_and_push(repo: Path, token: str, runner_path: Path) -> None:
     )
     print(f"[{_now()}] Committed: {COMMIT_MSG}")
 
-    # Push
+    # Push with force-with-lease (safe force push)
     subprocess.run(
-        ["git", "push", REMOTE_NAME, BRANCH],
+        ["git", "push", "--force-with-lease", REMOTE_NAME, BRANCH],
         cwd=repo, check=True,
     )
     print(f"[{_now()}] Pushed to {REMOTE_NAME}/{BRANCH}")
@@ -202,7 +141,18 @@ def main() -> None:
     print(f"[{_now()}] Runner={runner_path}")
     print(f"[{_now()}] Press Ctrl+C to stop.")
 
-    while True:
+    # Handle graceful shutdown
+    shutdown = False
+    def _signal_handler(signum, frame):
+        nonlocal shutdown
+        print(f"\n[{_now()}] Shutdown signal received, finishing current cycle...")
+        shutdown = True
+
+    import signal
+    signal.signal(signal.SIGINT, _signal_handler)
+    signal.signal(signal.SIGTERM, _signal_handler)
+
+    while not shutdown:
         try:
             if not (repo_path / ".git").exists():
                 print(f"[{_now()}] Initialising git repo in {repo_path}")
@@ -221,21 +171,18 @@ def main() -> None:
                     cwd=repo_path, check=True,
                 )
             _commit_and_push(repo_path, GIT_TOKEN, runner_path)
+        except subprocess.CalledProcessError as exc:
+            print(f"[{_now()}] Git command failed: {exc}")
+            if exc.stderr:
+                print(f"[{_now()}] stderr: {exc.stderr.decode() if isinstance(exc.stderr, bytes) else exc.stderr}")
         except Exception as exc:
             print(f"[{_now()}] ERROR: {exc}")
 
-        time.sleep(INTERVAL_SEC)
+        if not shutdown:
+            time.sleep(INTERVAL_SEC)
+
+    print(f"[{_now()}] Autocommit stopped.")
 
 
 if __name__ == "__main__":
     main()
-
-
-# >>> AUTOCOMMIT-HEARTBEAT >>>
-# last-run-utc = 2026-09-11T12:29:49Z
-# token-hash  = 9f5240f6911be0e9
-# <<< AUTOCOMMIT-HEARTBEAT <<<
-
-# last-run-utc = 2026-09-11T10:22:09Z
-# token-hash  = 78fa6dab71eeb8eb
-# <<< AUTOCOMMIT-HEARTBEAT <<<
