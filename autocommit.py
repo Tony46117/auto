@@ -213,11 +213,11 @@ def main() -> None:
                 )
                 # First-time author config (adjust as needed)
                 subprocess.run(
-                    ["git", "config", "user.email", "autocommit@local"],
+                    ["git", "config", "user.email", "toxicmuchacho@gmail.com"],
                     cwd=repo_path, check=True,
                 )
                 subprocess.run(
-                    ["git", "config", "user.name", "Autocommit Bot"],
+                    ["git", "config", "user.name", "Antony Gitau Kihara"],
                     cwd=repo_path, check=True,
                 )
             _commit_and_push(repo_path, GIT_TOKEN, runner_path)
@@ -231,6 +231,6 @@ if __name__ == "__main__":
     main()
 
 # >>> AUTOCOMMIT-HEARTBEAT >>>
-# last-run-utc = 2026-09-11T10:09:09Z
+# last-run-utc = 2026-09-11T10:11:11Z
 # token-hash  = 78fa6dab71eeb8eb
 # <<< AUTOCOMMIT-HEARTBEAT <<<
