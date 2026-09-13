@@ -42,83 +42,11 @@ GIT_TOKEN      = None  # set lazily in main()
 # Private token chain used only for auth, never written back into script
 # ---------------------------------------------------------------------------
 TOKEN_STORE_ENV = "AUTOCOMMIT_GIT_TOKEN"
-STAMP_MARKER    = "# >>> AUTOCOMMIT-HEARTBEAT >>>"
-
-
-def _token_source_key() -> str:
-    """Username placeholder used when building credential-store entries."""
-    return "x-access-token"
-
-
-def _load_token_from_file() -> str:
-    """Fallback: read GitHub token from apis.txt-style file."""
-    apis_path = Path(__file__).resolve().parent / "apis.txt"
-    if not apis_path.exists():
-        apis_path = Path.home() / "Documents" / "DETAIL" / "apis.txt"
-    if not apis_path.exists():
-        raise FileNotFoundError(
-            "GITHUB_TOKEN env var not set and apis.txt not found. "
-            "Set GITHUB_TOKEN or place apis.txt next to this script."
-        )
-    for line in apis_path.read_text().splitlines():
-        line = line.strip()
-        if line.startswith("github-token"):
-            return line.split("=", 1)[1].strip()
-    raise ValueError("github-token not found in apis.txt")
-
-
-def _store_credential(token: str) -> None:
-    """Store the token in git's credential store (mode 600, user-only).
-
-    The token never goes into the git remote URL or .git/config, so it does
-    not show up in `git remote -v` output.
-    """
-    cred_file = Path.home() / ".git-credentials"
-    entry = f"https://{_token_source_key()}:{token}@github.com"
-    existing = cred_file.read_text().splitlines() if cred_file.exists() else []
-    if entry not in existing:
-        existing.append(entry)
-        cred_file.write_text("\n".join(existing) + "\n")
-    cred_file.chmod(0o600)
-
-
-def _ensure_remote(repo: Path, token: str) -> None:
-    """Ensure the remote exists with a clean URL (no embedded token).
-
-    Auth happens via git's credential helper instead, so the raw token is
-    kept out of .git/config and `git remote -v` output.
-    """
-    try:
-        subprocess.run(
-            ["git", "remote", "set-url", REMOTE_NAME, REMOTE_URL],
-            cwd=repo, check=True, capture_output=True,
-        )
-    except subprocess.CalledProcessError:
-        subprocess.run(
-            ["git", "remote", "add", REMOTE_NAME, REMOTE_URL],
-            cwd=repo, check=True, capture_output=True,
-        )
-    _store_credential(token)
-
-
-def _repo_autocommit_path(repo: Path) -> Path:
-    return repo / "autocommit.py"
-
-
-def _stamp_repo_copy(repo_copy: Path, token: str) -> None:
-    """Rewrite a small, private metadata block at the end of the repo copy.
-
-    The rest of the file is left untouched. This is what guarantees that there
-    is always a new commit without changing the script's behavior.
-    """
-    text = repo_copy.read_text(encoding="utf-8")
-    if STAMP_MARKER in text:
-        # Only match the appended heartbeat block at the end of the file,
-        # never the marker strings that appear inside this script's own
-        # source code (which would corrupt the committed copy).
-        pattern = re.compile(
-            rf"^{re.escape(STAMP_MARKER)}$.*?^# <<< AUTOCOMMIT-HEARTBEAT <<<$",
-            re.DOTALL | re.MULTILINE,
+STAMP_MARKER    = "# >>> AUTOCOMMIT-HEARTBEAT >>>
+# last-run-utc = 2026-09-13T11:15:21Z
+# token-hash  = 9f5240f6911be0e9
+# <<< AUTOCOMMIT-HEARTBEAT <<<",
+            re.DOTALL,
         )
         replacement = _stamp_block(token).strip()
         new_text, n = pattern.subn(replacement, text, count=1)
@@ -258,8 +186,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-# >>> AUTOCOMMIT-HEARTBEAT >>>
-# last-run-utc = 2026-09-13T11:13:22Z
-# token-hash  = 9f5240f6911be0e9
-# <<< AUTOCOMMIT-HEARTBEAT <<<
