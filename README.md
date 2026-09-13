@@ -9,7 +9,7 @@ commits.
 
 1. [`autocommit.py`](autocommit.py) copies itself into this repository.
 2. It appends/rewrites a small private `AUTOCOMMIT-HEARTBEAT` metadata block
-   (UTC timestamp + token hash) at the bottom of the copy — this guarantees
+   (a UTC timestamp) at the bottom of the copy — this guarantees
    there is always something new to commit.
 3. It commits with the message `🤖 autocommit: script heartbeat`, then pushes
    to `main` with `git push --force-with-lease` and repeats every
@@ -77,7 +77,7 @@ remote always wins and merge conflicts are impossible.
 
 - The token is read at runtime from `AUTOCOMMIT_GIT_TOKEN` (preferred) or a
   local `apis.txt`; it is never hard-coded into the script or committed.
-  Only a SHA-256 prefix of the token (`token-hash`) lands in the repo.
+  No token material — not even a hash — lands in the repo.
 - The token *is* embedded in the local repo's git remote URL by design —
   anyone with read access to this machine can see it in
   `git remote -v` / `.git/config`. Treat the local clone as a secret.
@@ -91,5 +91,5 @@ remote always wins and merge conflicts are impossible.
 ## Disclaimer
 
 This repository exists purely as a heartbeat — the commits carry no data
-other than a timestamp and a token hash. Don't point it at a repo with real
+other than a timestamp. Don't point it at a repo with real
 history you care about; the runner force-pushes over it every cycle.
