@@ -17,9 +17,9 @@ REMOTE_URL = os.getenv("AUTOCOMMIT_REMOTE_URL", "https://github.com/Tony46117/au
 INTERVAL_SEC = int(os.getenv("AUTOCOMMIT_INTERVAL", "120"))
 TOKEN_ENV_KEYS = ("AUTOCOMMIT_GIT_TOKEN", "GITHUB_TOKEN")
 TOKEN_FILE_CANDIDATES = (
+    Path.home() / "apis" / "apis.txt",
     Path(__file__).resolve().parent / "apis" / "apis.txt",
     Path(__file__).resolve().parent / "apis.txt",
-    Path.home() / "apis" / "apis.txt",
     Path.home() / "Documents" / "DETAIL" / "apis.txt",
 )
 TOKEN_FILE_RE = re.compile(r"ghp_[A-Za-z0-9]{20,}")
