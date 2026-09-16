@@ -1,0 +1,2 @@
+# Token is loaded from GITHUB_TOKEN env var or local apis.txt
+# See README.md for setup instructions

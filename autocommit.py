@@ -1,172 +1,201 @@
 #!/usr/bin/env python3
+"""Autocommit — commits and pushes itself every 2 minutes to a git repository."""
+
 from __future__ import annotations
+
 import os
 import re
 import shutil
 import signal
 import subprocess
-import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-REPO_DIR = Path(os.getenv("AUTOCOMMIT_REPO_DIR", str(Path.home() / "auto")))
-COMMIT_MSG = os.getenv("AUTOCOMMIT_MSG", "\U0001f916 autocommit: script heartbeat")
-BRANCH = os.getenv("AUTOCOMMIT_BRANCH", "main")
-REMOTE_NAME = os.getenv("AUTOCOMMIT_REMOTE", "origin")
-REMOTE_URL = os.getenv("AUTOCOMMIT_REMOTE_URL", "https://github.com/Tony46117/auto.git")
-INTERVAL_SEC = int(os.getenv("AUTOCOMMIT_INTERVAL", "120"))
-TOKEN_ENV_KEYS = ("AUTOCOMMIT_GIT_TOKEN", "GITHUB_TOKEN")
-TOKEN_FILE_CANDIDATES = (
-    Path(__file__).resolve().parent / "apis" / "apis.txt",
-    Path(__file__).resolve().parent / "apis.txt",
-    Path.home() / "apis" / "apis.txt",
-    Path.home() / "Documents" / "DETAIL" / "apis.txt",
+
+REPO_DIR       = os.getenv("AUTOCOMMIT_REPO_DIR", str(Path.home() / "auto-repo"))
+COMMIT_MSG     = os.getenv(
+    "AUTOCOMMIT_MSG",
+    "autocommit: script heartbeat"
 )
-TOKEN_FILE_RE = re.compile(r"ghp_[A-Za-z0-9]{20,}")
-STAMP_MARKER = "# >>> AUTOCOMMIT-HEARTBEAT >>>"
-STAMP_END = "# <<< AUTOCOMMIT-HEARTBEAT <<<"
-STAMP_BLOCK_RE = re.compile(
-    rf"^{re.escape(STAMP_MARKER)}$.*?^{re.escape(STAMP_END)}$",
-    re.DOTALL | re.MULTILINE,
-)
-_GIT_ENV = {
-    **os.environ,
-    "GIT_TERMINAL_PROMPT": "0",
-    "GIT_ASKPASS": "echo",
-    "GCM_INTERACTIVE": "never",
-}
-def _now() -> str:
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-def _stamp_block() -> str:
-    stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    return f"\n{STAMP_MARKER}\n# last-run-utc = {stamp}\n{STAMP_END}\n"
-def load_token() -> str:
-    for key in TOKEN_ENV_KEYS:
-        value = os.getenv(key, "").strip()
-        if value:
-            return value
-    for candidate in TOKEN_FILE_CANDIDATES:
-        if candidate.is_file():
-            text = candidate.read_text(encoding="utf-8", errors="replace")
-            match = TOKEN_FILE_RE.search(text)
-            if match:
-                return match.group(0)
-    raise FileNotFoundError(
-        "No GitHub token found: set AUTOCOMMIT_GIT_TOKEN or GITHUB_TOKEN, "
-        "or place a file containing ghp_... at one of: "
-        + ", ".join(str(c) for c in TOKEN_FILE_CANDIDATES)
-    )
-def _git(repo: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess:
-    return subprocess.run(
-        ["git", *args],
-        cwd=repo,
-        env=_GIT_ENV,
-        capture_output=True,
-        text=True,
-        check=check,
-    )
-def _ensure_repo(repo: Path) -> None:
-    if (repo / ".git").is_dir():
-        return
-    print(f"[{_now()}] Initialising git repo in {repo}")
-    repo.mkdir(parents=True, exist_ok=True)
-    _git(repo, "init")
-    _git(repo, "checkout", "-b", BRANCH)
-    _git(repo, "config", "user.email", "toxicmuchacho@gmail.com")
-    _git(repo, "config", "user.name", "Antony Gitau Kihara")
-    if REMOTE_URL:
-        try:
-            _git(repo, "remote", "add", REMOTE_NAME, REMOTE_URL)
-        except subprocess.CalledProcessError:
-            _git(repo, "remote", "set-url", REMOTE_NAME, REMOTE_URL)
-def _sync_with_remote(repo: Path) -> None:
+BRANCH         = os.getenv("AUTOCOMMIT_BRANCH", "main")
+REMOTE_NAME    = os.getenv("AUTOCOMMIT_REMOTE", "origin")
+REMOTE_URL     = "https://github.com/Tony46117/auto.git"
+INTERVAL_SEC   = int(os.getenv("AUTOCOMMIT_INTERVAL", "120"))
+GIT_TOKEN      = None
+
+TOKEN_STORE_ENV = "AUTOCOMMIT_GIT_TOKEN"
+STAMP_MARKER    = "# >>> AUTOCOMMIT-HEARTBEAT >>>"
+CLOSE_MARKER    = "# <<< AUTOCOMMIT-HEARTBEAT <<<"
+
+
+def _token_source_key() -> str:
+    return "x-access-token"
+
+
+def _load_token_from_file() -> str:
+    apis_path = Path(__file__).resolve().parent / "apis.txt"
+    if not apis_path.exists():
+        apis_path = Path.home() / "Documents" / "DETAIL" / "apis.txt"
+    if not apis_path.exists():
+        raise FileNotFoundError(
+            "GITHUB_TOKEN env var not set and apis.txt not found. "
+            "Set GITHUB_TOKEN or place apis.txt next to this script."
+        )
+    for line in apis_path.read_text().splitlines():
+        line = line.strip()
+        if line.startswith("github-token"):
+            return line.split("=", 1)[1].strip()
+    raise ValueError("github-token not found in apis.txt")
+
+
+def _store_credential(token: str) -> None:
+    cred_file = Path.home() / ".git-credentials"
+    entry = f"https://{_token_source_key()}:{token}@github.com"
+    existing = cred_file.read_text().splitlines() if cred_file.exists() else []
+    if entry not in existing:
+        existing.append(entry)
+        cred_file.write_text("\n".join(existing) + "\n")
+    cred_file.chmod(0o600)
+
+
+def _ensure_remote(repo: Path, token: str) -> None:
     try:
-        _git(repo, "fetch", REMOTE_NAME)
-    except subprocess.CalledProcessError as exc:
-        print(f"[{_now()}] fetch failed (offline?): {exc.stderr.strip()}")
-        return
-    head = f"{REMOTE_NAME}/{BRANCH}"
-    exists = _git(repo, "rev-parse", "--verify", "--quiet", head, check=False)
-    if exists.returncode == 0:
-        reset = _git(repo, "reset", "--hard", head, check=False)
-        if reset.returncode != 0:
-            print(f"[{_now()}] reset failed: {reset.stderr.strip()}")
-    else:
-        print(f"[{_now()}] remote branch {head} not found; starting fresh history")
-def _stamp_repo_copy(repo_copy: Path) -> bool:
+        subprocess.run(
+            ["git", "remote", "set-url", REMOTE_NAME, REMOTE_URL],
+            cwd=repo, check=True, capture_output=True,
+        )
+    except subprocess.CalledProcessError:
+        subprocess.run(
+            ["git", "remote", "add", REMOTE_NAME, REMOTE_URL],
+            cwd=repo, check=True, capture_output=True,
+        )
+    _store_credential(token)
+
+
+def _repo_autocommit_path(repo: Path) -> Path:
+    return repo / "autocommit.py"
+
+
+def _stamp_block() -> str:
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return (
+        "\n"
+        + STAMP_MARKER + "\n"
+        + f"last-run-utc = {now}\n"
+        + CLOSE_MARKER + "\n"
+    )
+
+
+def _stamp_repo_copy(repo_copy: Path) -> None:
     text = repo_copy.read_text(encoding="utf-8")
-    replacement = _stamp_block().rstrip("\n")
     if STAMP_MARKER in text:
-        new_text, count = STAMP_BLOCK_RE.subn(replacement, text, count=1)
-        if count == 1:
-            if new_text == text:
-                return False
+        pattern = re.compile(
+            rf"^{re.escape(STAMP_MARKER)}$.*?^{re.escape(CLOSE_MARKER)}$",
+            re.DOTALL | re.MULTILINE,
+        )
+        replacement = _stamp_block().strip()
+        new_text, n = pattern.subn(replacement, text, count=1)
+        if n == 1 and new_text != text:
             repo_copy.write_text(new_text, encoding="utf-8")
-            return True
+            return
     if not text.endswith("\n"):
         text += "\n"
     repo_copy.write_text(text + _stamp_block(), encoding="utf-8")
-    return True
-def _copy_runner(repo: Path, runner_path: Path) -> None:
-    repo_copy = repo / "autocommit.py"
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _commit_and_push(repo: Path, token: str, runner_path: Path) -> None:
+    _ensure_remote(repo, token)
+
+    subprocess.run(["git", "fetch", REMOTE_NAME], cwd=repo, check=True)
+    subprocess.run(["git", "reset", "--hard", f"{REMOTE_NAME}/{BRANCH}"], cwd=repo, check=True)
+    subprocess.run(["git", "checkout", BRANCH], cwd=repo, check=True)
+
+    repo_copy = _repo_autocommit_path(repo)
     shutil.copy(runner_path, repo_copy)
-    return _stamp_repo_copy(repo_copy)
-def _commit_and_push(repo: Path, runner_path: Path) -> bool:
-    _sync_with_remote(repo)
-    changed = _copy_runner(repo, runner_path)
-    _git(repo, "add", "-A")
-    status = _git(repo, "status", "--porcelain")
+    _stamp_repo_copy(repo_copy)
+
+    subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
+
+    status = subprocess.run(
+        ["git", "status", "--porcelain"], cwd=repo,
+        check=True, capture_output=True, text=True,
+    )
     if not status.stdout.strip():
-        return False
-    if not changed:
-        print(f"[{_now()}] skipping commit: no heartbeat change (staying in sync)")
-        return False
-    commit = _git(repo, "commit", "-m", COMMIT_MSG)
-    print(f"[{_now()}] committed: {COMMIT_MSG}")
-    push = _git(repo, "push", REMOTE_NAME, BRANCH, check=False)
-    if push.returncode != 0:
-        print(f"[{_now()}] push failed: {push.stderr.strip()}")
-        return False
-    print(f"[{_now()}] pushed to {REMOTE_NAME}/{BRANCH}")
-    return True
-_shutdown = False
-def _handle_signal(signum, frame) -> None:
-    global _shutdown
-    _shutdown = True
-    print(f"\n[{_now()}] shutdown signal received, finishing cycle...")
-def main() -> int:
-    signal.signal(signal.SIGINT, _handle_signal)
-    signal.signal(signal.SIGTERM, _handle_signal)
-    try:
-        load_token()
-    except FileNotFoundError as exc:
-        print(f"[{_now()}] FATAL: {exc}")
-        return 1
-    repo = REPO_DIR
+        print(f"[{_now()}] Nothing to commit, skipping.")
+        return
+
+    subprocess.run(
+        ["git", "commit", "-m", COMMIT_MSG],
+        cwd=repo, check=True,
+    )
+    print(f"[{_now()}] Committed: {COMMIT_MSG}")
+
+    subprocess.run(
+        ["git", "push", "--force-with-lease", REMOTE_NAME, BRANCH],
+        cwd=repo, check=True,
+    )
+    print(f"[{_now()}] Pushed to {REMOTE_NAME}/{BRANCH}")
+
+
+def main() -> None:
+    global GIT_TOKEN
+    if GIT_TOKEN is None:
+        GIT_TOKEN = os.getenv(TOKEN_STORE_ENV) or _load_token_from_file()
+
+    repo_path = Path(REPO_DIR)
+    repo_path.mkdir(parents=True, exist_ok=True)
+
     runner_path = Path(__file__).resolve()
-    print(f"[{_now()}] autocommit starting — repo={repo}, interval={INTERVAL_SEC}s")
-    print(f"[{_now()}] remote={REMOTE_URL}")
-    print(f"[{_now()}] token sourced from env or token file (never hard-coded)")
-    print(f"[{_now()}] press Ctrl+C to stop")
-    try:
-        while not _shutdown:
-            try:
-                _ensure_repo(repo)
-                _commit_and_push(repo, runner_path)
-            except subprocess.CalledProcessError as exc:
-                stderr = exc.stderr if isinstance(exc.stderr, str) else (exc.stderr or b"")
-                print(f"[{_now()}] git command failed: {exc.cmd}")
-                if stderr:
-                    print(f"[{_now()}] stderr: {stderr}")
-            except Exception as exc:
-                print(f"[{_now()}] ERROR: {exc}")
-            if not _shutdown:
-                for _ in range(INTERVAL_SEC):
-                    if _shutdown:
-                        break
-                    time.sleep(1)
-    finally:
-        print(f"[{_now()}] autocommit stopped")
-    return 0
+
+    print(f"[{_now()}] Autocommit starting — repo={repo_path}, interval={INTERVAL_SEC}s")
+    print(f"[{_now()}] Target remote={REMOTE_NAME} {REMOTE_URL}")
+    print(f"[{_now()}] Token sourced from env or apis.txt (not stored in script).")
+    print(f"[{_now()}] Runner={runner_path}")
+    print(f"[{_now()}] Press Ctrl+C to stop.")
+
+    shutdown = False
+    def _signal_handler(signum, frame):
+        nonlocal shutdown
+        print(f"\n[{_now()}] Shutdown signal received, finishing current cycle...")
+        shutdown = True
+
+    signal.signal(signal.SIGINT, _signal_handler)
+    signal.signal(signal.SIGTERM, _signal_handler)
+
+    while not shutdown:
+        try:
+            if not (repo_path / ".git").exists():
+                print(f"[{_now()}] Initialising git repo in {repo_path}")
+                subprocess.run(["git", "init"], cwd=repo_path, check=True)
+                subprocess.run(
+                    ["git", "branch", "-m", BRANCH],
+                    cwd=repo_path, check=True,
+                )
+                subprocess.run(
+                    ["git", "config", "user.email", "toxicmuchacho@gmail.com"],
+                    cwd=repo_path, check=True,
+                )
+                subprocess.run(
+                    ["git", "config", "user.name", "Antony Gitau Kihara"],
+                    cwd=repo_path, check=True,
+                )
+            _commit_and_push(repo_path, GIT_TOKEN, runner_path)
+        except subprocess.CalledProcessError as exc:
+            print(f"[{_now()}] Git command failed: {exc}")
+            if exc.stderr:
+                print(f"[{_now()}] stderr: {exc.stderr.decode() if isinstance(exc.stderr, bytes) else exc.stderr}")
+        except Exception as exc:
+            print(f"[{_now()}] ERROR: {exc}")
+
+        if not shutdown:
+            time.sleep(INTERVAL_SEC)
+
+    print(f"[{_now()}] Autocommit stopped.")
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
