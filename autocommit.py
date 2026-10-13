@@ -1,5 +1,18 @@
 #!/usr/bin/env python3
+"""Fast self-updating heartbeat: commit + push every few seconds.
+
+Speed design (default cycle: 1 file write + 2 git processes, no network fetch):
+  1. Stamp the heartbeat block onto this file (only real work that varies).
+  2. `git commit --no-verify -m <msg> -- autocommit.py` (no separate `add`,
+     no hooks, no `status` probe).
+  3. `git push --force-with-lease` — needs no `fetch` because a successful
+     push updates the remote-tracking ref, which acts as the lease. The
+     fetch+reset round trip only happens after a rejected push.
+The GitHub token is read from the local `apis.txt` (primary) or env
+(fallback) and is embedded only in the remote URL — never hard-coded.
+"""
 from __future__ import annotations
+
 import os
 import re
 import shutil
@@ -9,53 +22,65 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+
 REPO_DIR = Path(os.getenv("AUTOCOMMIT_REPO_DIR", str(Path.home() / "auto")))
 COMMIT_MSG = os.getenv("AUTOCOMMIT_MSG", "\U0001f916 autocommit: script heartbeat")
 BRANCH = os.getenv("AUTOCOMMIT_BRANCH", "main")
 REMOTE_NAME = os.getenv("AUTOCOMMIT_REMOTE", "origin")
 REMOTE_URL = os.getenv("AUTOCOMMIT_REMOTE_URL", "https://github.com/Tony46117/auto.git")
-INTERVAL_SEC = int(os.getenv("AUTOCOMMIT_INTERVAL", "120"))
+INTERVAL_SEC = float(os.getenv("AUTOCOMMIT_INTERVAL", "5"))
 TOKEN_ENV_KEYS = ("AUTOCOMMIT_GIT_TOKEN", "GITHUB_TOKEN")
 TOKEN_FILE_CANDIDATES = (
     Path.home() / "apis" / "apis.txt",
     Path(__file__).resolve().parent / "apis" / "apis.txt",
+    Path.home() / "apis.txt",
     Path(__file__).resolve().parent / "apis.txt",
-    Path.home() / "Documents" / "DETAIL" / "apis.txt",
 )
-TOKEN_FILE_RE = re.compile(r"ghp_[A-Za-z0-9]{20,}")
+TOKEN_FILE_RE = re.compile(r"ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{82}")
 STAMP_MARKER = "# >>> AUTOCOMMIT-HEARTBEAT >>>"
 STAMP_END = "# <<< AUTOCOMMIT-HEARTBEAT <<<"
 STAMP_BLOCK_RE = re.compile(
     rf"^{re.escape(STAMP_MARKER)}$.*?^{re.escape(STAMP_END)}$",
     re.DOTALL | re.MULTILINE,
 )
+SLEEP_QUANTUM = 0.2  # seconds; keeps Ctrl+C responsive during the wait
+
 _GIT_ENV = {
     **os.environ,
     "GIT_TERMINAL_PROMPT": "0",
     "GIT_ASKPASS": "echo",
     "GCM_INTERACTIVE": "never",
 }
+
+
 def _now() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
 def _stamp_block() -> str:
     stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     return f"\n{STAMP_MARKER}\n# last-run-utc = {stamp}\n{STAMP_END}\n"
+
+
 def load_token() -> str:
-    for key in TOKEN_ENV_KEYS:
-        value = os.getenv(key, "").strip()
-        if value:
-            return value
+    # apis.txt is the primary source (per README), env vars are the fallback.
     for candidate in TOKEN_FILE_CANDIDATES:
         if candidate.is_file():
             text = candidate.read_text(encoding="utf-8", errors="replace")
             match = TOKEN_FILE_RE.search(text)
             if match:
                 return match.group(0)
+    for key in TOKEN_ENV_KEYS:
+        value = os.getenv(key, "").strip()
+        if value:
+            return value
     raise FileNotFoundError(
-        "No GitHub token found: set AUTOCOMMIT_GIT_TOKEN or GITHUB_TOKEN, "
-        "or place a file containing ghp_... at one of: "
+        "No GitHub token found: place a file containing ghp_... at one of: "
         + ", ".join(str(c) for c in TOKEN_FILE_CANDIDATES)
+        + " (or set AUTOCOMMIT_GIT_TOKEN / GITHUB_TOKEN)"
     )
+
+
 def _git(repo: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess:
     return subprocess.run(
         ["git", *args],
@@ -65,33 +90,37 @@ def _git(repo: Path, *args: str, check: bool = True) -> subprocess.CompletedProc
         text=True,
         check=check,
     )
+
+
 def _ensure_repo(repo: Path) -> None:
     if not (repo / ".git").is_dir():
         print(f"[{_now()}] Initialising git repo in {repo}")
         repo.mkdir(parents=True, exist_ok=True)
         _git(repo, "init")
         _git(repo, "checkout", "-b", BRANCH)
-        if REMOTE_URL:
-            try:
-                _git(repo, "remote", "add", REMOTE_NAME, REMOTE_URL)
-            except subprocess.CalledProcessError:
-                _git(repo, "remote", "set-url", REMOTE_NAME, REMOTE_URL)
+    # Auth: embed the apis.txt token in the push URL (no askpass round-trips).
+    token = load_token()
+    url = REMOTE_URL.replace("https://", f"https://{token}@", 1)
+    try:
+        _git(repo, "remote", "add", REMOTE_NAME, url)
+    except subprocess.CalledProcessError:
+        _git(repo, "remote", "set-url", REMOTE_NAME, url)
     _git(repo, "config", "user.email", "toxicmuchacho@gmail.com")
     _git(repo, "config", "user.name", "Antony Gitau Kihara")
-def _sync_with_remote(repo: Path) -> None:
+    # One-off speed knobs: never auto-gc, never sign.
+    _git(repo, "config", "gc.auto", "0")
+    _git(repo, "config", "commit.gpgsign", "false")
+
+
+def _recover(repo: Path) -> None:  # slow path, only after a rejected push
     try:
-        _git(repo, "fetch", REMOTE_NAME)
+        _git(repo, "fetch", "--quiet", REMOTE_NAME)
+        _git(repo, "reset", "--hard", "--quiet", f"{REMOTE_NAME}/{BRANCH}")
+        print(f"[{_now()}] recovered: fetched + reset to {REMOTE_NAME}/{BRANCH}")
     except subprocess.CalledProcessError as exc:
-        print(f"[{_now()}] fetch failed (offline?): {exc.stderr.strip()}")
-        return
-    head = f"{REMOTE_NAME}/{BRANCH}"
-    exists = _git(repo, "rev-parse", "--verify", "--quiet", head, check=False)
-    if exists.returncode == 0:
-        reset = _git(repo, "reset", "--hard", head, check=False)
-        if reset.returncode != 0:
-            print(f"[{_now()}] reset failed: {reset.stderr.strip()}")
-    else:
-        print(f"[{_now()}] remote branch {head} not found; starting fresh history")
+        print(f"[{_now()}] recovery failed (offline?): {exc.stderr.strip()}")
+
+
 def _stamp_repo_copy(repo_copy: Path) -> bool:
     text = repo_copy.read_text(encoding="utf-8")
     replacement = _stamp_block().rstrip("\n")
@@ -106,34 +135,53 @@ def _stamp_repo_copy(repo_copy: Path) -> bool:
         text += "\n"
     repo_copy.write_text(text + _stamp_block(), encoding="utf-8")
     return True
+
+
 def _copy_runner(repo: Path, runner_path: Path) -> bool:
     repo_copy = repo / "autocommit.py"
     if runner_path.resolve() != repo_copy.resolve():
         shutil.copy(runner_path, repo_copy)
     return _stamp_repo_copy(repo_copy)
-def _commit_and_push(repo: Path, runner_path: Path) -> bool:
-    _sync_with_remote(repo)
-    changed = _copy_runner(repo, runner_path)
-    _git(repo, "add", "-A")
-    status = _git(repo, "status", "--porcelain")
-    if not status.stdout.strip():
-        return False
-    if not changed:
-        print(f"[{_now()}] skipping commit: no heartbeat change (staying in sync)")
-        return False
-    _git(repo, "commit", "-m", COMMIT_MSG)
-    print(f"[{_now()}] committed: {COMMIT_MSG}")
-    push = _git(repo, "push", REMOTE_NAME, BRANCH, check=False)
+
+
+def _commit_and_push(repo: Path, runner_path: Path, script_name: str) -> bool:
+    if not _copy_runner(repo, runner_path):
+        return False  # same second: nothing new to commit
+    # Single git call: commits only this script's change — no `add`, no hooks.
+    _git(repo, "commit", "--no-verify", "--quiet", "-m", COMMIT_MSG, "--", script_name)
+    # Happy path: no fetch needed — the remote-tracking ref updated by the
+    # last push serves as a valid force-with-lease.
+    push = _git(
+        repo, "push", "--quiet", "--force-with-lease",
+        REMOTE_NAME, BRANCH, check=False,
+    )
     if push.returncode != 0:
-        print(f"[{_now()}] push failed: {push.stderr.strip()}")
-        return False
-    print(f"[{_now()}] pushed to {REMOTE_NAME}/{BRANCH}")
+        print(f"[{_now()}] push rejected; using slow sync path ({push.stderr.strip()})")
+        _recover(repo)
+        _git(repo, "commit", "--no-verify", "--quiet", "-m", COMMIT_MSG, "--", script_name)
+        push = _git(repo, "push", "--quiet", "--force-with-lease", REMOTE_NAME, BRANCH, check=False)
+        if push.returncode != 0:
+            print(f"[{_now()}] push failed: {push.stderr.strip()}")
+            return False
+    print(f"[{_now()}] committed + pushed to {REMOTE_NAME}/{BRANCH}")
     return True
+
+
 _shutdown = False
+
+
 def _handle_signal(signum, frame) -> None:
     global _shutdown
     _shutdown = True
     print(f"\n[{_now()}] shutdown signal received, finishing cycle...")
+
+
+def _wait(interval: float) -> None:
+    end = time.monotonic() + interval
+    while not _shutdown and time.monotonic() < end:
+        time.sleep(min(SLEEP_QUANTUM, max(0.0, end - time.monotonic())))
+
+
 def main() -> int:
     signal.signal(signal.SIGINT, _handle_signal)
     signal.signal(signal.SIGTERM, _handle_signal)
@@ -144,15 +192,17 @@ def main() -> int:
         return 1
     repo = REPO_DIR
     runner_path = Path(__file__).resolve()
-    print(f"[{_now()}] autocommit starting — repo={repo}, interval={INTERVAL_SEC}s")
-    print(f"[{_now()}] remote={REMOTE_URL}")
-    print(f"[{_now()}] token sourced from env or token file (never hard-coded)")
+    script_name = runner_path.name
+    print(f"[{_now()}] autocommit (fast mode) starting — repo={repo}, interval={INTERVAL_SEC}s")
+    print(f"[{_now()}] remote={REMOTE_URL} (token embedded from apis.txt/env)")
     print(f"[{_now()}] press Ctrl+C to stop")
+    _ensure_repo(repo)
     try:
         while not _shutdown:
+            started = time.monotonic()
             try:
                 _ensure_repo(repo)
-                _commit_and_push(repo, runner_path)
+                _commit_and_push(repo, runner_path, script_name)
             except subprocess.CalledProcessError as exc:
                 stderr = exc.stderr if isinstance(exc.stderr, str) else (exc.stderr or b"")
                 print(f"[{_now()}] git command failed: {exc.cmd}")
@@ -160,107 +210,17 @@ def main() -> int:
                     print(f"[{_now()}] stderr: {stderr}")
             except Exception as exc:
                 print(f"[{_now()}] ERROR: {exc}")
+            elapsed = time.monotonic() - started
             if not _shutdown:
-                for _ in range(INTERVAL_SEC):
-                    if _shutdown:
-                        break
-                    time.sleep(1)
+                _wait(max(0.0, INTERVAL_SEC - elapsed))
     finally:
         print(f"[{_now()}] autocommit stopped")
     return 0
+
+
 if __name__ == "__main__":
     sys.exit(main())
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 # >>> AUTOCOMMIT-HEARTBEAT >>>
-# last-run-utc = 2026-10-13T10:02:40Z
+# last-run-utc = 2026-10-13T10:04:59Z
 # <<< AUTOCOMMIT-HEARTBEAT <<<
