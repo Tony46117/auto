@@ -254,6 +254,9 @@ def _wait(interval: float) -> None:
 
 
 def main() -> int:
+    if hasattr(sys.stdout, "reconfigure"):
+        # Line-buffered so `nohup ... > log` shows progress as it happens.
+        sys.stdout.reconfigure(line_buffering=True)
     signal.signal(signal.SIGINT, _handle_signal)
     signal.signal(signal.SIGTERM, _handle_signal)
     try:

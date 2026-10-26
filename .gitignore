@@ -5,3 +5,4 @@ apis/
 __pycache__/
 *.pyc
 opt_log_*.txt
+.autocommit.lock

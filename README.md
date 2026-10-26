@@ -21,7 +21,15 @@ The fast path never fetches: a successful push updates the remote-tracking
 ref, which serves as a valid `--force-with-lease`. The slower
 `git fetch` + `git reset --hard origin/main` recovery round trip only runs
 after a rejected push, so the remote always wins and merge conflicts are
-impossible.
+impossible. Because that reset throws away the cycle's commit, the retry
+re-stamps the heartbeat and commits again (up to `AUTOCOMMIT_PUSH_ATTEMPTS`
+times) instead of retrying a commit that no longer has anything in it.
+
+The committed copy of the script is the version that is *running* (captured at
+startup), so a reset that restores an older file pushed by someone else can't
+pull the checkout back to stale code. Only one instance may run per script
+directory: a second one exits immediately instead of fighting the first over
+the branch, which is what produced `cannot lock ref` rejection storms.
 
 The GitHub token is read from the local `apis.txt` (primary source) or env
 vars (fallback) and embedded in the remote push URL, so authentication needs
@@ -72,6 +80,8 @@ no askpass prompt or credential-helper lookup.
 | `AUTOCOMMIT_BRANCH`     | `main`                           | Branch to push                   |
 | `AUTOCOMMIT_REMOTE`     | `origin`                         | Remote name                      |
 | `AUTOCOMMIT_INTERVAL`   | `5`                              | Seconds between pushes           |
+| `AUTOCOMMIT_PUSH_ATTEMPTS` | `3`                           | Commit+push tries per cycle after rejections |
+| `AUTOCOMMIT_LOCK_FILE`  | `./.autocommit.lock`             | Single-instance lock             |
 
 ## Repository layout
 
