@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import os
 import re
-import shutil
 import signal
 import subprocess
 import sys
@@ -23,12 +22,24 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+try:
+    import fcntl
+except ImportError:  # non-POSIX: run without the single-instance guard
+    fcntl = None
+
 REPO_DIR = Path(os.getenv("AUTOCOMMIT_REPO_DIR", str(Path.home() / "auto")))
 COMMIT_MSG = os.getenv("AUTOCOMMIT_MSG", "\U0001f916 autocommit: script heartbeat")
 BRANCH = os.getenv("AUTOCOMMIT_BRANCH", "main")
 REMOTE_NAME = os.getenv("AUTOCOMMIT_REMOTE", "origin")
 REMOTE_URL = os.getenv("AUTOCOMMIT_REMOTE_URL", "https://github.com/Tony46117/auto.git")
 INTERVAL_SEC = float(os.getenv("AUTOCOMMIT_INTERVAL", "5"))
+PUSH_ATTEMPTS = max(1, int(os.getenv("AUTOCOMMIT_PUSH_ATTEMPTS", "3")))
+LOCK_FILE = Path(
+    os.getenv(
+        "AUTOCOMMIT_LOCK_FILE",
+        str(Path(__file__).resolve().parent / ".autocommit.lock"),
+    )
+)
 TOKEN_ENV_KEYS = ("AUTOCOMMIT_GIT_TOKEN", "GITHUB_TOKEN")
 TOKEN_FILE_CANDIDATES = (
     Path.home() / "apis" / "apis.txt",
@@ -36,7 +47,9 @@ TOKEN_FILE_CANDIDATES = (
     Path.home() / "apis.txt",
     Path(__file__).resolve().parent / "apis.txt",
 )
-TOKEN_FILE_RE = re.compile(r"ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{82}")
+TOKEN_FILE_RE = re.compile(
+    r"gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}"
+)
 STAMP_MARKER = "# >>> AUTOCOMMIT-HEARTBEAT >>>"
 STAMP_END = "# <<< AUTOCOMMIT-HEARTBEAT <<<"
 STAMP_BLOCK_RE = re.compile(
@@ -121,50 +134,108 @@ def _recover(repo: Path) -> None:  # slow path, only after a rejected push
         print(f"[{_now()}] recovery failed (offline?): {exc.stderr.strip()}")
 
 
-def _stamp_repo_copy(repo_copy: Path) -> bool:
-    text = repo_copy.read_text(encoding="utf-8")
+def _stamp_text(text: str) -> str | None:
+    """Rewrite (or append) the heartbeat block. None means "already current"."""
     replacement = _stamp_block().rstrip("\n")
     if STAMP_MARKER in text:
         new_text, count = STAMP_BLOCK_RE.subn(replacement, text, count=1)
         if count == 1:
-            if new_text == text:
-                return False
-            repo_copy.write_text(new_text, encoding="utf-8")
-            return True
+            return None if new_text == text else new_text
     if not text.endswith("\n"):
         text += "\n"
-    repo_copy.write_text(text + _stamp_block(), encoding="utf-8")
-    return True
+    return text + _stamp_block()
 
 
-def _copy_runner(repo: Path, runner_path: Path) -> bool:
-    repo_copy = repo / "autocommit.py"
-    if runner_path.resolve() != repo_copy.resolve():
-        shutil.copy(runner_path, repo_copy)
-    return _stamp_repo_copy(repo_copy)
+def _stamp_runner(repo: Path, runner_text: str, script_name: str) -> bool:
+    """Write the *running* version of this script, stamped, into the repo.
 
-
-def _commit_and_push(repo: Path, runner_path: Path, script_name: str) -> bool:
-    if not _copy_runner(repo, runner_path):
+    The source is taken from memory (captured at startup), not re-read from
+    disk: `_recover` resets the checkout, so the file on disk can be an older
+    copy pushed by another writer — we must not commit that one.
+    """
+    target = repo / script_name
+    new_text = _stamp_text(runner_text)
+    if new_text is None:
         return False  # same second: nothing new to commit
-    # Single git call: commits only this script's change — no `add`, no hooks.
-    _git(repo, "commit", "--no-verify", "--quiet", "-m", COMMIT_MSG, "--", script_name)
-    # Happy path: no fetch needed — the remote-tracking ref updated by the
-    # last push serves as a valid force-with-lease.
-    push = _git(
-        repo, "push", "--quiet", "--force-with-lease",
-        REMOTE_NAME, BRANCH, check=False,
-    )
-    if push.returncode != 0:
-        print(f"[{_now()}] push rejected; using slow sync path ({push.stderr.strip()})")
-        _recover(repo)
-        _git(repo, "commit", "--no-verify", "--quiet", "-m", COMMIT_MSG, "--", script_name)
-        push = _git(repo, "push", "--quiet", "--force-with-lease", REMOTE_NAME, BRANCH, check=False)
-        if push.returncode != 0:
-            print(f"[{_now()}] push failed: {push.stderr.strip()}")
+    if target.is_file():
+        current = target.read_text(encoding="utf-8", errors="replace")
+        if current == new_text:
             return False
-    print(f"[{_now()}] committed + pushed to {REMOTE_NAME}/{BRANCH}")
+    target.write_text(new_text, encoding="utf-8")
     return True
+
+
+def _stamp_and_commit(repo: Path, runner_text: str, script_name: str) -> bool:
+    if not _stamp_runner(repo, runner_text, script_name):
+        return False
+    # Single git call: commits only this script's change — no `add`, no hooks.
+    commit = _git(
+        repo, "commit", "--no-verify", "--quiet", "-m", COMMIT_MSG, "--",
+        script_name, check=False,
+    )
+    if commit.returncode == 0:
+        return True
+    combined = f"{commit.stdout}\n{commit.stderr}"
+    if "nothing to commit" in combined or "no changes added" in combined:
+        return False  # nothing staged (e.g. reset restored an identical copy)
+    raise subprocess.CalledProcessError(
+        commit.returncode, commit.args, commit.stdout, commit.stderr
+    )
+
+
+def _commit_and_push(repo: Path, runner_text: str, script_name: str) -> bool:
+    """One heartbeat cycle, retrying across rejected pushes.
+
+    A rejected `--force-with-lease` means another writer moved the branch, so
+    the recovery is fetch + reset (remote wins). That reset throws away this
+    cycle's commit, so the retry has to stamp and commit again — retrying the
+    commit alone is what used to fail with "nothing to commit".
+    """
+    for attempt in range(1, PUSH_ATTEMPTS + 1):
+        if not _stamp_and_commit(repo, runner_text, script_name):
+            if attempt == 1:
+                return False  # same-second heartbeat, nothing new to push
+            _wait(1.0)  # reset restored a same-second stamp: let the clock tick
+            continue
+        # Happy path: no fetch needed — the remote-tracking ref updated by the
+        # last push serves as a valid force-with-lease.
+        push = _git(
+            repo, "push", "--quiet", "--force-with-lease",
+            REMOTE_NAME, BRANCH, check=False,
+        )
+        if push.returncode == 0:
+            print(f"[{_now()}] committed + pushed to {REMOTE_NAME}/{BRANCH}")
+            return True
+        lines = [line.strip() for line in push.stderr.splitlines() if line.strip()]
+        detail = next(
+            (line for line in lines if line.startswith(("!", "error:", "fatal:"))),
+            lines[-1] if lines else "unknown error",
+        )
+        print(
+            f"[{_now()}] push rejected (attempt {attempt}/{PUSH_ATTEMPTS}): {detail}; "
+            f"fetching + resetting to {REMOTE_NAME}/{BRANCH}"
+        )
+        _recover(repo)
+    print(f"[{_now()}] giving up after {PUSH_ATTEMPTS} push attempts")
+    return False
+
+
+def _acquire_lock(path: Path):
+    """Stop a second instance from racing this one over the same branch."""
+    if fcntl is None:
+        return None
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = open(path, "a+")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        handle.close()
+        return None
+    handle.seek(0)
+    handle.truncate()
+    handle.write(f"{os.getpid()}\n")
+    handle.flush()
+    return handle
 
 
 _shutdown = False
@@ -193,6 +264,15 @@ def main() -> int:
     repo = REPO_DIR
     runner_path = Path(__file__).resolve()
     script_name = runner_path.name
+    # Snapshot the running source now: `_recover` may reset the on-disk copy.
+    runner_text = runner_path.read_text(encoding="utf-8")
+    lock = _acquire_lock(LOCK_FILE)
+    if fcntl is not None and lock is None:
+        print(
+            f"[{_now()}] FATAL: another autocommit instance already holds "
+            f"{LOCK_FILE} (two instances fight over the branch); exiting"
+        )
+        return 1
     print(f"[{_now()}] autocommit (fast mode) starting — repo={repo}, interval={INTERVAL_SEC}s")
     print(f"[{_now()}] remote={REMOTE_URL} (token embedded from apis.txt/env)")
     print(f"[{_now()}] press Ctrl+C to stop")
@@ -201,8 +281,7 @@ def main() -> int:
         while not _shutdown:
             started = time.monotonic()
             try:
-                _ensure_repo(repo)
-                _commit_and_push(repo, runner_path, script_name)
+                _commit_and_push(repo, runner_text, script_name)
             except subprocess.CalledProcessError as exc:
                 stderr = exc.stderr if isinstance(exc.stderr, str) else (exc.stderr or b"")
                 print(f"[{_now()}] git command failed: {exc.cmd}")
@@ -3453,6 +3532,7 @@ if __name__ == "__main__":
 
 
 
+
 # >>> AUTOCOMMIT-HEARTBEAT >>>
-# last-run-utc = 2026-10-26T08:07:32Z
+# last-run-utc = 2026-10-26T08:10:36Z
 # <<< AUTOCOMMIT-HEARTBEAT <<<
